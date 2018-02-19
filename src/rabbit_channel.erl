@@ -426,7 +426,7 @@ init([Channel, ReaderPid, WriterPid, ConnPid, ConnName, Protocol, User, VHost,
                 limiter                 = Limiter,
                 tx                      = none,
                 next_tag                = 1,
-                unacked_message_q       = queue:new(),
+                unacked_message_q       = gb_trees:empty(),
                 user                    = User,
                 virtual_host            = VHost,
                 most_recently_declared_queue = <<>>,
@@ -1311,10 +1311,10 @@ handle_method(#'basic.qos'{global         = true,
 handle_method(#'basic.qos'{global         = true,
                            prefetch_count = PrefetchCount},
               _, State = #ch{limiter = Limiter, unacked_message_q = UAMQ}) ->
-    %% TODO queue:len(UAMQ) is not strictly right since that counts
+    %% TODO gb_trees:size(UAMQ) is not strictly right since that counts
     %% unacked messages from basic.get too. Pretty obscure though.
     Limiter1 = rabbit_limiter:limit_prefetch(Limiter,
-                                             PrefetchCount, queue:len(UAMQ)),
+                                             PrefetchCount, gb_trees:size(UAMQ)),
     case ((not rabbit_limiter:is_active(Limiter)) andalso
           rabbit_limiter:is_active(Limiter1)) of
         true  -> rabbit_amqqueue:activate_limit_all(
@@ -1326,7 +1326,15 @@ handle_method(#'basic.qos'{global         = true,
 handle_method(#'basic.recover_async'{requeue = true},
               _, State = #ch{unacked_message_q = UAMQ, limiter = Limiter}) ->
     OkFun = fun () -> ok end,
-    UAMQL = queue:to_list(UAMQ),
+
+    % TODO: are these in the correct order?. 
+    %
+    % Q = queue:new(), Q1 = queue:in(1, Q), Q2 = queue:in(2, Q1), queue:to_list(Q2).
+    % [1,2]
+    % T = gb_trees:empty(), T1 = gb_trees:insert(1, 1, T), T2 = gb_trees:insert(2, 2, T1), gb_trees:values(T2).
+    % [1,2]
+
+    UAMQL = gb_trees:values(UAMQ),
     foreach_per_queue(
       fun (QPid, MsgIds) ->
               rabbit_misc:with_exit_handler(
@@ -1336,7 +1344,7 @@ handle_method(#'basic.recover_async'{requeue = true},
     ok = notify_limiter(Limiter, UAMQL),
     %% No answer required - basic.recover is the newer, synchronous
     %% variant of this method
-    {noreply, State#ch{unacked_message_q = queue:new()}};
+    {noreply, State#ch{unacked_message_q = gb_trees:empty()}};
 
 handle_method(#'basic.recover_async'{requeue = false}, _, _State) ->
     rabbit_misc:protocol_error(not_implemented, "requeue=false", []);
@@ -1454,8 +1462,11 @@ handle_method(#'tx.rollback'{}, _, #ch{tx = none}) ->
 
 handle_method(#'tx.rollback'{}, _, State = #ch{unacked_message_q = UAMQ,
                                                tx = {_Msgs, Acks}}) ->
+    % TODO: not sure we need all these reverses :/
     AcksL = lists:append(lists:reverse([lists:reverse(L) || {_, L} <- Acks])),
-    UAMQ1 = queue:from_list(lists:usort(AcksL ++ queue:to_list(UAMQ))),
+
+    UAMQ1 = add_acks(AcksL, UAMQ),
+
     {reply, #'tx.rollback_ok'{}, State#ch{unacked_message_q = UAMQ1,
                                           tx                = new_tx()}};
 
@@ -1489,6 +1500,12 @@ handle_method(_MethodRecord, _Content, _State) ->
       command_invalid, "unimplemented method", []).
 
 %%----------------------------------------------------------------------------
+
+add_acks(Messages, UnackedMessages) ->
+  lists:foldl(fun({DeliveryTag, _CTag, _Msg} = Message, Tree) ->
+    gb_trees:insert(DeliveryTag, Message, Tree)
+  end, UnackedMessages, Messages).
+
 
 %% We get the queue process to send the consume_ok on our behalf. This
 %% is for symmetry with basic.cancel - see the comment in that method
@@ -1722,40 +1739,57 @@ record_sent(ConsumerTag, AckRequired,
     end,
     rabbit_trace:tap_out(Msg, ConnName, ChannelNum, Username, TraceState),
     UAMQ1 = case AckRequired of
-                true  -> queue:in({DeliveryTag, ConsumerTag, {QPid, MsgId}},
+                true  -> gb_trees:insert(DeliveryTag, {DeliveryTag, ConsumerTag, {QPid, MsgId}},
                                   UAMQ);
                 false -> UAMQ
             end,
     State#ch{unacked_message_q = UAMQ1, next_tag = DeliveryTag + 1}.
 
-%% NB: returns acks in youngest-first order
-collect_acks(Q, 0, true) ->
-    {lists:reverse(queue:to_list(Q)), queue:new()};
-collect_acks(Q, DeliveryTag, Multiple) ->
-    collect_acks([], [], Q, DeliveryTag, Multiple).
 
-collect_acks(ToAcc, PrefixAcc, Q, DeliveryTag, Multiple) ->
-    case queue:out(Q) of
-        {{value, UnackedMsg = {CurrentDeliveryTag, _ConsumerTag, _Msg}},
-         QTail} ->
-            if CurrentDeliveryTag == DeliveryTag ->
-                    {[UnackedMsg | ToAcc],
-                     case PrefixAcc of
-                         [] -> QTail;
-                         _  -> queue:join(
-                                 queue:from_list(lists:reverse(PrefixAcc)),
-                                 QTail)
-                     end};
-               Multiple ->
-                    collect_acks([UnackedMsg | ToAcc], PrefixAcc,
-                                 QTail, DeliveryTag, Multiple);
-               true ->
-                    collect_acks(ToAcc, [UnackedMsg | PrefixAcc],
-                                 QTail, DeliveryTag, Multiple)
-            end;
-        {empty, _} ->
-            precondition_failed("unknown delivery tag ~w", [DeliveryTag])
-    end.
+%% TODO: implement DeliveryTag==0 fast path?
+collect_acks(Q, DeliveryTag, true) ->
+  collect_acks_multiple([], Q, DeliveryTag);
+
+collect_acks(Q, DeliveryTag, false) ->
+  case take_any(DeliveryTag, Q) of
+    error ->
+      precondition_failed("unknown delivery tag ~w", [DeliveryTag]);
+    {UnackedMessage, Q1} ->
+      {[UnackedMessage], Q1}
+  end.
+
+%% reimplementation of gb_trees:take_any that is on erlang R20+
+take_any(Key, Tree) ->
+  case gb_trees:is_defined(Key, Tree) of
+    true ->
+      Value = gb_trees:get(Key, Tree),
+
+      Tree1 = gb_trees:delete(Key, Tree),
+      {Value, Tree1};
+    false ->
+      error
+  end.
+
+ 
+collect_acks_multiple(ToAcc, Q, DeliveryTag) ->
+  case gb_trees:is_empty(Q) of
+    true ->
+      {ToAcc, Q};
+    false ->
+      {NextDeliveryTag, NextUnackedMessage, Q1} = gb_trees:take_smallest(Q),
+      ToAcc1 = [NextUnackedMessage | ToAcc],
+      case NextDeliveryTag of
+        Tag when Tag < DeliveryTag ->
+          collect_acks_multiple(ToAcc1, Q1, DeliveryTag);
+        Tag when Tag =:= DeliveryTag ->
+          {ToAcc1, Q1};
+        _ ->
+          % if the tag does not exist we generate an error even if there
+          % were tags < the current tag that are ackable
+          precondition_failed("unknown delivery tag ~w", [DeliveryTag]) 
+      end
+  end.
+ 
 
 %% NB: Acked is in youngest-first order
 ack(Acked, State = #ch{queue_names = QNames}) ->
@@ -1999,7 +2033,7 @@ i(confirm,        #ch{confirm_enabled  = CE})      -> CE;
 i(name,           State)                           -> name(State);
 i(consumer_count,          #ch{consumer_mapping = CM})    -> maps:size(CM);
 i(messages_unconfirmed,    #ch{unconfirmed = UC})         -> dtree:size(UC);
-i(messages_unacknowledged, #ch{unacked_message_q = UAMQ}) -> queue:len(UAMQ);
+i(messages_unacknowledged, #ch{unacked_message_q = UAMQ}) -> gb_trees:size(UAMQ);
 i(messages_uncommitted,    #ch{tx = {Msgs, _Acks}})       -> queue:len(Msgs);
 i(messages_uncommitted,    #ch{})                         -> 0;
 i(acks_uncommitted,        #ch{tx = {_Msgs, Acks}})       -> ack_len(Acks);
